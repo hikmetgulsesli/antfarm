@@ -485,7 +485,25 @@ export function claimStep(agentId: string): ClaimResult {
           return { found: false };
         }
 
-        // No pending or failed stories — mark step done and advance
+        // Guard: 0 total stories means planner never produced STORIES_JSON (#157)
+        const totalStories = (db.prepare(
+          "SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?"
+        ).get(step.run_id) as { cnt: number }).cnt;
+        if (totalStories === 0) {
+          db.prepare(
+            "UPDATE steps SET status = 'failed', output = 'No stories found — planner did not produce STORIES_JSON', updated_at = datetime('now') WHERE id = ?"
+          ).run(step.id);
+          db.prepare(
+            "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
+          ).run(step.run_id);
+          const wfId = getWorkflowId(step.run_id);
+          emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.id, agentId: agentId, detail: "Loop has 0 stories — planner did not produce STORIES_JSON" });
+          emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Loop has 0 stories — planner did not produce STORIES_JSON" });
+          scheduleRunCronTeardown(step.run_id);
+          return { found: false };
+        }
+
+        // No pending or failed stories — all done, mark step done and advance
         db.prepare(
           "UPDATE steps SET status = 'done', updated_at = datetime('now') WHERE id = ?"
         ).run(step.id);
@@ -605,6 +623,21 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
 
   // T5: Parse STORIES_JSON from output (any step, typically the planner)
   parseAndInsertStories(output, step.run_id);
+
+  // T5b: Validate that plan steps feeding a loop actually produced stories
+  // Without this guard, a planner that outputs STATUS: done without STORIES_JSON
+  // causes the implement loop to silently succeed with 0 iterations (#157)
+  if (step.step_id === "plan") {
+    const storyCount = (db.prepare(
+      "SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?"
+    ).get(step.run_id) as { cnt: number }).cnt;
+    const hasStoryLoop = db.prepare(
+      "SELECT id FROM steps WHERE run_id = ? AND type = 'loop' AND loop_config LIKE '%stories%' LIMIT 1"
+    ).get(step.run_id);
+    if (hasStoryLoop && storyCount === 0) {
+      throw new Error("Plan step completed but produced no STORIES_JSON — planner output must include STORIES_JSON: [...] with story array");
+    }
+  }
 
   // T7: Loop step completion
   if (step.type === "loop" && step.current_story_id) {
